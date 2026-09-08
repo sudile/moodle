@@ -25,11 +25,41 @@ import {
     notifyUploadCompleted,
 } from 'core_form/events';
 import {getFilePicker} from 'editor_tiny/options';
+import {getString} from 'core/str';
 
 // This image uploader is based on advice given at:
 // https://www.tiny.cloud/docs/tinymce/6/upload-images/
 export default (editor, filePickerType, blob, fileName, progress) => new Promise((resolve, reject) => {
-    notifyUploadStarted(editor.targetElm.id);
+    const options = getFilePicker(editor, filePickerType);
+
+    if (!options) {
+        // This editor has no file picker of this type, for example when it is configured with
+        // maxfiles set to 0, or when it is shown to a guest or not-logged-in user. There is no
+        // draft file area to upload into, so reject before notifying the form of an upload.
+        getString('uploadnotallowed')
+            .then((message) => reject({message, remove: true}))
+            .catch(reject);
+        return;
+    }
+
+    const uploadStarted = notifyUploadStarted(editor.targetElm.id);
+
+    // The form must be notified that the upload finished on every exit path, otherwise its submit
+    // buttons remain disabled for the lifetime of the page. notifyUploadStarted resolves a string
+    // before it dispatches its event, so chain the completed event off it to guarantee that the
+    // two are never dispatched out of order.
+    const notifyComplete = () => uploadStarted
+        .catch(() => null)
+        .then(() => notifyUploadCompleted(editor.targetElm.id));
+
+    const completeAndResolve = (location) => {
+        notifyComplete();
+        resolve(location);
+    };
+    const completeAndReject = (reason) => {
+        notifyComplete();
+        reject(reason);
+    };
 
     const xhr = new XMLHttpRequest();
 
@@ -40,7 +70,7 @@ export default (editor, filePickerType, blob, fileName, progress) => new Promise
 
     xhr.addEventListener('load', () => {
         if (xhr.status === 403) {
-            reject({
+            completeAndReject({
                 message: `HTTP error: ${xhr.status}`,
                 remove: true,
             });
@@ -48,18 +78,21 @@ export default (editor, filePickerType, blob, fileName, progress) => new Promise
         }
 
         if (xhr.status < 200 || xhr.status >= 300) {
-            reject(`HTTP Error: ${xhr.status}`);
+            completeAndReject(`HTTP Error: ${xhr.status}`);
             return;
         }
 
-        const response = JSON.parse(xhr.responseText);
+        let response;
+        try {
+            response = JSON.parse(xhr.responseText);
+        } catch (error) {
+            response = null;
+        }
 
         if (!response) {
-            reject(`Invalid JSON: ${xhr.responseText}`);
+            completeAndReject(`Invalid JSON: ${xhr.responseText}`);
             return;
         }
-
-        notifyUploadCompleted(editor.targetElm.id);
 
         let location;
         if (response.url) {
@@ -72,7 +105,7 @@ export default (editor, filePickerType, blob, fileName, progress) => new Promise
         }
 
         if (location && typeof location === 'string') {
-            resolve(location);
+            completeAndResolve(location);
             return;
         }
 
@@ -86,18 +119,17 @@ export default (editor, filePickerType, blob, fileName, progress) => new Promise
             output = errorString;
         }
 
-        reject(output);
+        completeAndReject(output);
     });
 
     xhr.addEventListener('error', () => {
-        reject({
+        completeAndReject({
             message: `Upload failed due to an XHR transport error. Code: ${xhr.status}`,
             remove: true,
         });
     });
 
     const formData = new FormData();
-    const options = getFilePicker(editor, filePickerType);
 
     formData.append('repo_upload_file', blob, fileName);
     formData.append('itemid', options.itemid);
